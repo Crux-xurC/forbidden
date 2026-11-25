@@ -1,0 +1,344 @@
+#!/usr/bin/env bash
+# forbidden -- a wall around a command or a shell: nothing inside reaches the network,
+# but for one door (a local port inside the wall that leads to a unix socket outside,
+# where Citlalpol -- the fake outside -- listens). docs/ja/design-memo.md has the design.
+#
+#   forbidden run [--door <name>] [--strict [--dir <path>]] -- <command> [args...]
+#   forbidden on [--door <name>]        a shell inside the wall (forbidden off leaves it)
+#   forbidden off | status
+#   forbidden door list | add <name> --port <n> --socket <path> [--proxy-protocol v2 [--catch-all]] | rm <name>
+#   forbidden hide list | add <path> | rm <path>   more paths hidden inside the wall (e.g. Citlalpol's own)
+#   forbidden shell-init bash           eval "$(forbidden shell-init bash)" in ~/.bashrc
+#   forbidden check                     can this machine build the wall?
+#
+# Two strengths. By default (run / on) it guards against accidents: a network
+# namespace, the loopback, the door, the known sockets that could act outside
+# hidden. --strict is for looking at a program you do not trust (bubblewrap): your
+# files, $XDG_RUNTIME_DIR, the environment and other processes are not shown, the
+# terminal is a new session, and the only door is Citlalpol's. Neither stands
+# against kernel exploits -- use a virtual machine for that.
+set -u
+here="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+lib="$here/lib"
+config_dir="${FORBIDDEN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/forbidden}"
+doors_file="$config_dir/doors.json"
+runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+die() { echo "forbidden: $*" >&2; exit 125; }
+inside() { [ -n "${FORBIDDEN_ACTIVE:-}" ]; }
+
+usage() { sed -n '4,11p' "$(readlink -f "${BASH_SOURCE[0]}")" | sed 's/^# \{0,1\}//'; }
+
+# -- can the wall be built here ------------------------------------------------------
+check() {
+  command -v unshare >/dev/null || die "unshare (util-linux) is not installed"
+  command -v ip >/dev/null || die "ip (iproute2) is not installed"
+  if [ "${1:-}" = catch-all ]; then
+    command -v nft >/dev/null || die "a door that catches all needs nft (nftables) -- or add the door without --catch-all"
+  fi
+  if ! unshare --user --map-root-user --net true 2>/dev/null; then
+    local why="this kernel does not let an ordinary user make a user namespace"
+    [ "$(cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null)" = 0 ] && why="kernel.unprivileged_userns_clone is 0"
+    [ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns 2>/dev/null)" = 1 ] &&
+      why="AppArmor restricts unprivileged user namespaces (kernel.apparmor_restrict_unprivileged_userns=1)"
+    die "cannot build the wall: $why"
+  fi
+}
+
+# -- doors.json -----------------------------------------------------------------------
+# door <name> -> "port<TAB>socket<TAB>proxy", or dies
+door_of() {
+  [ -f "$doors_file" ] || die "no doors ($doors_file); add one with: forbidden door add <name> --port <n> --socket <path>"
+  python3 - "$doors_file" "$1" "$runtime" <<'PY' || exit 125
+import json, os, sys
+path, name, runtime = sys.argv[1:]
+doors = json.load(open(path))
+d = doors.get(name)
+if not d:
+    sys.exit("forbidden: no door %r in %s (forbidden door list)" % (name, path))
+sock = os.path.expandvars(d.get("socket", ""))
+real = os.path.realpath(os.path.dirname(sock))
+if not (real + "/").startswith(os.path.realpath(runtime) + "/"):
+    sys.exit("forbidden: the door %r leads to %s, outside %s -- a door may lead only to a socket of your own runtime directory" % (name, sock, runtime))
+print("%d\t%s\t%s\t%s" % (int(d["port"]), sock, d.get("proxy_protocol", ""), "catch-all" if d.get("catch_all") else ""))
+PY
+}
+
+door_cmd() {
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list)
+      [ -f "$doors_file" ] || { echo "(no doors: $doors_file)"; return 0; }
+      python3 - "$doors_file" <<'PY'
+import json, sys
+for n, d in json.load(open(sys.argv[1])).items():
+    print("%-12s 127.0.0.1:%-5s -> %s%s%s" % (n, d.get("port"), d.get("socket"), "  (PROXY v2)" if d.get("proxy_protocol") == "v2" else "",
+                                           "  (catches all)" if d.get("catch_all") else ""))
+PY
+      ;;
+    add|rm)
+      inside && die "doors are changed only from outside the wall"
+      [ "$sub" = rm ] && { [ $# -eq 1 ] || die "usage: forbidden door rm <name>"; }
+      local name="${1:-}"; shift || true
+      [ -n "$name" ] || die "usage: forbidden door $sub <name> ..."
+      local port="" sock="" proxy="" catch=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --port) port="$2"; shift 2 ;;
+          --socket) sock="$2"; shift 2 ;;
+          --proxy-protocol) proxy="$2"; shift 2 ;;
+          --catch-all) catch=1; shift ;;
+          --tcp) die "a door to a host TCP port is not made yet (a host port may hold a program that reaches out: the design memo's doors)" ;;
+          *) die "door $sub: unknown option $1" ;;
+        esac
+      done
+      mkdir -p "$config_dir"
+      python3 - "$doors_file" "$sub" "$name" "$port" "$sock" "$proxy" "$runtime" "$catch" <<'PY' || exit 125
+import json, os, sys
+path, sub, name, port, sock, proxy, runtime, catch = sys.argv[1:]
+doors = json.load(open(path)) if os.path.exists(path) else {}
+if sub == "rm":
+    if name not in doors:
+        sys.exit("forbidden: no door %r" % name)
+    del doors[name]
+else:
+    if not port.isdigit() or not (1 <= int(port) <= 65535):
+        sys.exit("forbidden: --port <1-65535>")
+    if not sock:
+        sys.exit("forbidden: --socket <path of a unix socket in %s>" % runtime)
+    real = os.path.realpath(os.path.dirname(os.path.expandvars(sock)))
+    if not (real + "/").startswith(os.path.realpath(runtime) + "/"):
+        sys.exit("forbidden: a door may lead only to a socket in %s (not %s)" % (runtime, sock))
+    if proxy not in ("", "v2"):
+        sys.exit("forbidden: --proxy-protocol v2")
+    if catch and proxy != "v2":
+        sys.exit("forbidden: --catch-all needs --proxy-protocol v2 (the header carries where each connection was going)")
+    if catch and int(port) > 65535 - 53:
+        sys.exit("forbidden: --catch-all uses the ports <port>+1 and <port>+53 inside the wall: a lower --port")
+    if catch and any(d.get("catch_all") for n, d in doors.items() if n != name):
+        sys.exit("forbidden: another door catches all already (one door only)")
+    doors[name] = {"port": int(port), "socket": sock}
+    if proxy:
+        doors[name]["proxy_protocol"] = proxy
+    if catch:
+        doors[name]["catch_all"] = True
+tmp = path + ".tmp"
+json.dump(doors, open(tmp, "w"), indent=2)
+os.replace(tmp, path)
+print("forbidden: door %s %s" % (name, "removed" if sub == "rm" else "added"))
+PY
+      ;;
+    *) die "usage: forbidden door list | add <name> --port <n> --socket <path> [--proxy-protocol v2 [--catch-all]] | rm <name>" ;;
+  esac
+}
+
+# -- the sockets that could act outside the wall (normal mode hides them) ------------
+hide_list() {
+  {
+    for p in bus emacs gnupg containers podman docker.sock systemd; do echo "$runtime/$p"; done
+    echo /run/dbus/system_bus_socket
+    echo /run/docker.sock
+    echo /run/podman
+    echo /nix/var/nix/daemon-socket
+    # name resolution through a local daemon (nsswitch's resolve, mdns, nscd) would leave the wall
+    echo /run/systemd/resolve
+    echo /run/avahi-daemon
+    echo /run/nscd
+    for s in "$HOME"/.gnupg/S.*; do [ -S "$s" ] && echo "$s"; done
+    [ -f "$config_dir/hide" ] && grep -v '^\s*\(#\|$\)' "$config_dir/hide"
+  } | while IFS= read -r p; do [ -e "$p" ] && readlink -f "$p"; done | sort -u
+}
+
+# -- more paths to hide (one a line in $config_dir/hide), changed only from outside --
+hide_cmd() {
+  local sub="${1:-list}"; shift || true
+  local f="$config_dir/hide"
+  case "$sub" in
+    list) [ -f "$f" ] && grep -v '^\s*\(#\|$\)' "$f"; return 0 ;;
+    add|rm)
+      inside && die "what is hidden is changed only from outside the wall"
+      [ $# -eq 1 ] || die "usage: forbidden hide $sub <path>"
+      local p; p="$(readlink -m "$1")"
+      case "$p" in /|/usr|/usr/*|/etc|/etc/*|/proc|/proc/*|/dev|/dev/*|/tmp|"$HOME") die "hide: not $p" ;; esac
+      mkdir -p "$config_dir"; touch "$f"
+      if [ "$sub" = add ]; then
+        grep -qxF "$p" "$f" || echo "$p" >> "$f"
+        echo "forbidden: $p is hidden inside the wall"
+      else
+        grep -vxF "$p" "$f" > "$f.tmp"; mv "$f.tmp" "$f"
+        echo "forbidden: $p is no longer hidden"
+      fi ;;
+    *) die "usage: forbidden hide list | add <path> | rm <path>" ;;
+  esac
+}
+
+new_run_id() { echo "f-$(date +%Y%m%d-%H%M%S)-$$"; }
+
+# -- the wall: user / network / mount / PID namespaces, lib/inside.sh as its PID 1 ----
+# wall <door> <mode> -- <command>: the loopback, the door (its relay and, for a door that catches all,
+# nftables), the config read-only, the known sockets hidden; then the command as the caller's own uid
+# with no capabilities over the wall. --strict runs bubblewrap as that command: its sandbox shares the
+# wall's network (so the door and the catch-all are the same), and nothing else.
+wall() {
+  local door="$1" mode="$2"; shift 3
+  local port="" sock="" proxy="" catch=""
+  if [ -n "$door" ]; then
+    IFS=$'\t' read -r port sock proxy catch < <(door_of "$door") || exit 125
+    [ -n "$port" ] || exit 125
+    [ -z "$catch" ] || check catch-all
+    [ -S "$sock" ] || die "the door $door leads to $sock, where nothing listens (is its program running?)"
+  fi
+  local hide; hide="$(mktemp /tmp/forbidden-hide.XXXXXX)"
+  hide_list > "$hide"
+  FORBIDDEN_MODE="$mode" unshare --user --map-root-user --net --mount --pid --fork --mount-proc --kill-child -- \
+    bash "$lib/inside.sh" "$(id -u)" "$(id -g)" "$port" "$sock" "$proxy" "$catch" "$config_dir" "$hide" -- "$@"
+  local code=$?
+  rm -f "$hide"
+  return $code
+}
+
+proxy_env() {  # the variables that point a program at the door (port), as NAME=VALUE lines
+  local u="http://127.0.0.1:$1"
+  printf '%s\n' "ALL_PROXY=socks5h://127.0.0.1:$1" "all_proxy=socks5h://127.0.0.1:$1" "HTTP_PROXY=$u" "http_proxy=$u" \
+    "HTTPS_PROXY=$u" "https_proxy=$u" "NO_PROXY=localhost,127.0.0.1" "no_proxy=localhost,127.0.0.1"
+}
+
+# -- run (normal) ---------------------------------------------------------------------
+run_normal() {
+  local door="$1"; shift
+  if [ -n "$door" ]; then
+    local port; port="$(door_of "$door" | cut -f1)" || exit 125
+    [ -n "$port" ] || exit 125
+    export FORBIDDEN_DOOR="$door"
+    local kv; while IFS= read -r kv; do export "$kv"; done < <(proxy_env "$port")
+  fi
+  export FORBIDDEN_ACTIVE=1 FORBIDDEN_RUN="${FORBIDDEN_RUN:-$(new_run_id)}"
+  wall "$door" normal -- "$@"
+}
+
+# -- run --strict -----------------------------------------------------------------------
+run_strict() {
+  local door="$1" dir="$2"; shift 2
+  command -v bwrap >/dev/null || die "--strict needs bubblewrap (bwrap)"
+  [ -z "$door" ] || [ "$door" = citlalpol ] || die "--strict has one door only, Citlalpol's (--door citlalpol)"
+  export FORBIDDEN_RUN="${FORBIDDEN_RUN:-$(new_run_id)}"
+  # every namespace of its own but the network: that is the wall's (the door, the catch-all)
+  local a=(--unshare-user --unshare-ipc --unshare-pid --unshare-uts --unshare-cgroup-try
+           --die-with-parent --new-session --cap-drop ALL --clearenv)
+  a+=(--ro-bind /usr /usr --ro-bind /etc /etc --ro-bind-try /opt /opt --ro-bind-try /nix/store /nix/store)
+  local l
+  for l in /bin /sbin /lib /lib64 /lib32; do
+    if [ -L "$l" ]; then a+=(--symlink "$(readlink "$l")" "$l"); elif [ -d "$l" ]; then a+=(--ro-bind "$l" "$l"); fi
+  done
+  a+=(--proc /proc --dev /dev --tmpfs /tmp --dir /var/tmp --tmpfs /run --tmpfs "$HOME")
+  a+=(--setenv HOME "$HOME" --setenv USER "${USER:-$(id -un)}" --setenv PATH "$PATH" --setenv LANG "${LANG:-C.UTF-8}"
+      --setenv TERM "${TERM:-dumb}" --setenv FORBIDDEN_ACTIVE 1 --setenv FORBIDDEN_MODE strict --setenv FORBIDDEN_RUN "$FORBIDDEN_RUN")
+  local copy="" chdir="$HOME"
+  if [ -n "$dir" ]; then
+    local abs; abs="$(readlink -f "$dir")" || die "--dir: $dir"
+    [ -d "$abs" ] || die "--dir: $dir is not a directory"
+    local tmp; tmp="$(mktemp -d "${TMPDIR:-/tmp}/forbidden-strict.XXXXXX")"
+    cp -a "$abs" "$tmp/" || die "--dir: cannot copy $abs"
+    copy="$tmp/$(basename "$abs")"
+    a+=(--bind "$copy" "$abs"); chdir="$abs"
+  fi
+  a+=(--chdir "$chdir")
+  if [ -n "$door" ]; then
+    local port; port="$(door_of "$door" | cut -f1)" || exit 125
+    [ -n "$port" ] || exit 125
+    a+=(--setenv FORBIDDEN_DOOR "$door")
+    local kv; while IFS= read -r kv; do a+=(--setenv "${kv%%=*}" "${kv#*=}"); done < <(proxy_env "$port")
+  fi
+  local code
+  wall "$door" strict -- bwrap "${a[@]}" -- "$@"
+  code=$?
+  [ -n "$copy" ] && echo "forbidden: what it wrote is in $copy (the original $dir is unchanged)" >&2
+  return $code
+}
+
+run_cmd() {
+  local door="" strict="" dir=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --door) door="$2"; shift 2 ;;
+      --strict) strict=1; shift ;;
+      --dir) dir="$2"; shift 2 ;;
+      --) shift; break ;;
+      -*) die "run: unknown option $1" ;;
+      *) break ;;
+    esac
+  done
+  [ $# -gt 0 ] || die "usage: forbidden run [--door <name>] [--strict [--dir <path>]] -- <command> [args...]"
+  [ -z "$dir" ] || [ -n "$strict" ] || die "--dir is for --strict"
+  check
+  if [ -n "$strict" ]; then run_strict "$door" "$dir" "$@"; else run_normal "$door" "$@"; fi
+}
+
+# -- on: a shell inside the wall --------------------------------------------------------
+on_cmd() {
+  inside && die "already inside the wall (forbidden off first)"
+  local door=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --door) door="$2"; shift 2 ;;
+      --strict) die "--strict has no shell to stay in: forbidden run --strict -- <command>" ;;
+      *) die "on: unknown option $1" ;;
+    esac
+  done
+  local rc; rc="$(mktemp /tmp/forbidden-rc.XXXXXX)"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  { echo '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
+    printf 'eval "$(%q shell-init bash)"\n' "$self"
+    echo 'PS1="[forbidden] ${PS1-\$ }"'
+    echo 'trap '"'"'[ -n "${FORBIDDEN_CWD_FILE:-}" ] && pwd > "$FORBIDDEN_CWD_FILE"'"'"' EXIT'
+  } > "$rc"
+  local code
+  run_normal "$door" bash --rcfile "$rc" -i
+  code=$?
+  rm -f "$rc"
+  return $code
+}
+
+status_cmd() {
+  if inside; then
+    echo "on (${FORBIDDEN_MODE:-normal})  run ${FORBIDDEN_RUN:-?}  door ${FORBIDDEN_DOOR:-none}"
+  else
+    echo "off"
+  fi
+}
+
+shell_init() {
+  [ "${1:-bash}" = bash ] || die "shell-init: only bash for now"
+  local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
+  cat <<SH
+# forbidden (shell-init bash): on / off / status in this shell
+forbidden() {
+  case "\${1:-}" in
+    on)
+      local __f_cwd; __f_cwd="\$(mktemp /tmp/forbidden-cwd.XXXXXX)"
+      FORBIDDEN_CWD_FILE="\$__f_cwd" command "$self" "\$@"
+      local __f_code=\$?
+      [ -s "\$__f_cwd" ] && builtin cd -- "\$(cat "\$__f_cwd")" 2>/dev/null
+      rm -f "\$__f_cwd"
+      return \$__f_code ;;
+    off)
+      if [ -n "\${FORBIDDEN_ACTIVE:-}" ] && [ "\${FORBIDDEN_MODE:-}" = normal ]; then builtin exit 0
+      else echo "forbidden: off already" >&2; return 1; fi ;;
+    *) command "$self" "\$@" ;;
+  esac
+}
+SH
+}
+
+case "${1:-}" in
+  run) shift; run_cmd "$@" ;;
+  on) shift; on_cmd "$@" ;;
+  off) inside && die "forbidden off is the shell function's (eval \"\$(forbidden shell-init bash)\"); here: exit" || die "off already" ;;
+  status) status_cmd ;;
+  door) shift; door_cmd "$@" ;;
+  hide) shift; hide_cmd "$@" ;;
+  shell-init) shift; shell_init "$@" ;;
+  check) check && echo "forbidden: the wall can be built here$(command -v bwrap >/dev/null && echo ' (and --strict: bwrap)' || echo ' (no bwrap: no --strict)')" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command $1 (forbidden help)" ;;
+esac
