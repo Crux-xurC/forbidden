@@ -46,5 +46,5 @@ bubblewrap for `--strict`. Doors live in
 `forbidden hide add <path>` hides more paths inside, e.g. Citlalpol's config and records); a door leads only to a unix socket in your own
 `$XDG_RUNTIME_DIR`. `test/run.sh` checks it all without reaching the network.
 
-**Status:** the wall, `on` / `off` / `status`, doors with PROXY protocol v2, the hidden sockets, `--strict` (2026-11-24) and a door
+**Version 0.1.0** (2026-11-25), a development release. **Status:** the wall, `on` / `off` / `status`, doors with PROXY protocol v2, the hidden sockets, `--strict` (2026-11-24) and a door
 that catches all, also under `--strict` (2026-11-25) work. Not yet: a door to a host TCP port, zsh / fish. The design: [docs/design.md](docs/design.md).
