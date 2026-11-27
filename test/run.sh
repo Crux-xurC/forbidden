@@ -11,6 +11,7 @@ runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 work="$(mktemp -d)"
 sockdir="$(mktemp -d "$runtime/forbidden-test.XXXXXX")"
 export FORBIDDEN_CONFIG_DIR="$work/config"
+export XDG_CACHE_HOME="$work/cache"   # on's rc and off's directory
 fails=0
 ok() { echo "  ok   $1"; }
 ng() { echo "  FAIL $1"; fails=$((fails + 1)); }
@@ -53,6 +54,7 @@ check "door add / list" '"$F" door list | grep -q "^test .*127.0.0.1:4600"'
 out="$("$F" run --door test -- curl -sS -m5 http://pong.citlalpol.test/ping)"
 check "curl through the door reaches the far side (pong)" '[ "$out" = pong ]'
 last="$(tail -1 "$work/door.log")"
+check "the far side gets the executable too (what the kernel runs, not what the process says)" '[[ "$(tail -1 "$work/door.log")" == *"\"exe\": \"/"*curl* ]]'
 check "the far side got PROXY v2 with the run and the process (curl)" \
   '[[ "$last" == *"\"proxy\": \"v2\""* && "$last" == *"\"run\": \"f-"* && "$last" == *"\"cmd\": \"curl "* && "$last" == *"GET http://pong.citlalpol.test/ping"* ]]'
 check "the door's socket directory is hidden inside" '! "$F" run --door test -- test -e "$sockdir/door.sock"'
@@ -95,6 +97,32 @@ except OSError as e: print("refused", e.errno)' 2>&1)"
 check "other UDP is refused at once" '[[ "$out" == "refused"* ]]'
 check "the command cannot remove the rules" '! "$F" run --door catch -- nft flush ruleset 2>/dev/null'
 "$F" door rm catch >/dev/null
+
+echo "2b. sockets of programs outside the wall (normal mode: /tmp and the runtime directory are the wall's own)"
+listen() { python3 -c 'import socket,sys,time; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); time.sleep(60)' "$1" & }
+reach() { "$F" run -- python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1]); print("reached")' "$1" 2>/dev/null; }
+tmuxdir="$(mktemp -d /tmp/forbidden-test-tmux.XXXXXX)"
+listen "$tmuxdir/default"; p1=$!
+listen "$sockdir/wayland-test"; p2=$!
+mkdir -p "$work/agent"; listen "$work/agent/agent.sock"; p3=$!
+sleep 0.3
+check "a socket under /tmp outside (tmux, X11 ...) is not there inside" '[ -S "$tmuxdir/default" ] && [ -z "$(reach "$tmuxdir/default")" ]'
+check "a socket in the runtime directory outside (Wayland ...) is not there inside" '[ -z "$(reach "$sockdir/wayland-test")" ]'
+check "the ssh-agent's socket, wherever it is, is hidden" '[ -z "$(SSH_AUTH_SOCK="$work/agent/agent.sock" reach "$work/agent/agent.sock")" ] && [ "$(reach "$work/agent/agent.sock")" = reached ]'
+kill $p1 $p2 $p3 2>/dev/null; rm -rf "$tmuxdir"
+out="$(DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 TMUX=/tmp/tmux-1/default,1,0 STY=1.pts SSH_AUTH_SOCK=/x "$F" run -- sh -c 'echo "${DISPLAY-}${WAYLAND_DISPLAY-}${TMUX-}${STY-}${SSH_AUTH_SOCK-}"')"
+check "...and the variables naming them are not set inside" '[ -z "$out" ]'
+out="$("$F" run -- sh -c 'python3 -c "import socket,time; s=socket.socket(socket.AF_UNIX); s.bind(\"/tmp/mine\"); s.listen(); time.sleep(3)" & sleep 0.5; python3 -c "import socket; socket.socket(socket.AF_UNIX).connect(\"/tmp/mine\"); print(\"mine\")"; ls -A "$XDG_RUNTIME_DIR" | wc -l' 2>/dev/null)"
+check "what the wall makes under /tmp is reached inside (its own tmux would be); its runtime directory starts empty" '[ "$out" = "mine
+0" ]'
+check "what the wall wrote under /tmp is not left outside" '[ ! -e /tmp/mine ]'
+tmuxdir="$(mktemp -d /tmp/forbidden-test-tmux.XXXXXX)"; listen "$tmuxdir/default"; p1=$!; sleep 0.3
+mkdir -p "$work/proj"
+rel="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$tmuxdir/default" "$work/proj")"
+out="$(cd "$work/proj" && "$F" run -- sh -c 'pwd; mktemp -p "${TMPDIR:-/tmp}" >/dev/null && echo tmp-ok; python3 -c "import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1]); print(\"reached\")" "'"$rel"'"' 2>/dev/null)"
+kill $p1 2>/dev/null; rm -rf "$tmuxdir"
+check "a directory under /tmp comes along (and \$TMPDIR), but .. from it does not reach the old /tmp" \
+  '[[ "$out" == "$work/proj"*tmp-ok* && "$out" != *reached* ]]'
 
 echo "3. on / off (the shell function)"
 cwd_after="$(cd "$work" && bash -c '

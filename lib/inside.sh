@@ -9,7 +9,9 @@
 #      anything else (UDP, ICMP, IPv6 but the loopback) is refused at once
 #   3. forbidden's config (doors, what is hidden) read-only; the known sockets that could act for the program
 #      outside the wall (D-Bus, an editor server, gpg-agent, podman, docker,
-#      nix-daemon) hidden
+#      nix-daemon, screen, ssh-agent) hidden; in normal mode /tmp and $XDG_RUNTIME_DIR are new and
+#      empty: what the shell and its programs make there is theirs, nothing from outside (tmux, X11,
+#      Wayland, a browser's single-instance socket ...) is there. --strict leaves this to bubblewrap
 #   4. the command, in one more user namespace as the caller's own uid and with
 #      no capabilities over the wall: it cannot bring the loopback down, add
 #      routes, or unmount what is hidden
@@ -17,8 +19,8 @@
 # Anything that cannot be set up stops the run (exit 125) -- never a wall with a hole.
 set -u
 lib="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-uid=$1 gid=$2 port=$3 sock=$4 proxy=$5 catch=$6 config=$7 hide=$8
-shift 8
+uid=$1 gid=$2 port=$3 sock=$4 proxy=$5 catch=$6 config=$7 hide=$8 runtime=$9 stage=${10}
+shift 10
 [ "${1:-}" = "--" ] && shift
 
 die() { echo "forbidden: $*" >&2; exit 125; }
@@ -65,6 +67,30 @@ if [ -n "$port" ]; then
     || die "cannot hide the door's socket ($(dirname "$sock"))"
 fi
 
+# normal mode: what is under /tmp and the runtime directory outside is not shown; the wall has its own
+# (the door's relay holds its socket's directory open already). Only the places the command works in
+# come along when they are under /tmp: its directory and $TMPDIR (nix develop's is /tmp/nix-shell.*).
+# The new /tmp is built aside ($stage, made by bin/forbidden) and moved over /tmp; then the directory is
+# taken again, so that `..` from it walks the new tree, not the old /tmp. --strict: bubblewrap gives its
+# own /tmp and /run, and its --dir copy is under the outside /tmp, so nothing here. Before what is hidden
+# below, so that it is hidden in the new tree too
+exec 3< "$hide"   # the list to hide is under the outside /tmp: open before /tmp is the wall's
+if [ "${FORBIDDEN_MODE:-normal}" = normal ]; then
+  here="$(pwd -P)"
+  mount -t tmpfs -o mode=1777 forbidden-tmp "$stage" 2>/dev/null || die "cannot give the wall its own /tmp"
+  for p in "$here" "${TMPDIR:-}"; do
+    p="$(readlink -f "$p" 2>/dev/null)" || continue
+    case "$p" in /tmp/?*) [ -d "$p" ] && echo "$p" ;; esac
+  done | sort -u | while IFS= read -r p; do
+    mkdir -p "$stage/${p#/tmp/}" && mount --bind "$p" "$stage/${p#/tmp/}" 2>/dev/null || die "cannot bring $p into the wall's /tmp"
+  done || exit 125
+  mount --move "$stage" /tmp 2>/dev/null || die "cannot give the wall its own /tmp"
+  cd / && cd "$here" 2>/dev/null || cd /
+  if [ -n "$runtime" ] && [ -d "$runtime" ]; then
+    mount -t tmpfs -o mode=700 forbidden-run "$runtime" 2>/dev/null || die "cannot give the wall its own $runtime"
+  fi
+fi
+
 # the whole config directory: a program inside must not change the doors, or what is hidden next time
 if [ -d "$config" ]; then
   { mount --bind "$config" "$config" && mount -o remount,bind,ro "$config"; } 2>/dev/null \
@@ -79,6 +105,7 @@ while IFS= read -r p; do
   elif [ -S "$p" ]; then
     mount --bind /dev/null "$p" 2>/dev/null || die "cannot hide $p"
   fi
-done < "$hide"
+done <&3
+exec 3<&-
 
 unshare --user --map-user="$uid" --map-group="$gid" -- "$@"

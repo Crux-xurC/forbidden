@@ -26,7 +26,7 @@ import sys
 import threading
 
 SIG = b"\r\n\r\n\x00\r\nQUIT\n"
-TLV = {"run": 0xE0, "pid": 0xE1, "cmd": 0xE2, "mode": 0xE3, "via": 0xE4}
+TLV = {"run": 0xE0, "pid": 0xE1, "cmd": 0xE2, "mode": 0xE3, "via": 0xE4, "exe": 0xE5}
 SO_ORIGINAL_DST = 80
 CMD_MAX = 1024
 
@@ -49,9 +49,12 @@ def socket_inode(local_port, tables=("/proc/net/tcp", "/proc/net/tcp6")):
 
 
 def process_of(inode):
-    """(pid, command line) of the process holding socket:[inode], or (None, None)"""
+    """(pid, command line, executable) of the process holding socket:[inode], or (None, None, None).
+    The command line is what the process says of itself (it can rewrite its own argv); the executable is
+    the file the kernel runs (/proc/<pid>/exe: an interpreter's, for a script); the pid is the first
+    holder of the socket found"""
     if not inode or inode == "0":
-        return None, None
+        return None, None, None
     target = "socket:[%s]" % inode
     me = str(os.getpid())
     for pid in os.listdir("/proc"):
@@ -64,12 +67,16 @@ def process_of(inode):
                     if os.readlink(os.path.join(fddir, fd)) == target:
                         with open("/proc/%s/cmdline" % pid, "rb") as c:
                             cmd = c.read().replace(b"\x00", b" ").strip()
-                        return int(pid), cmd[:CMD_MAX].decode("utf-8", "replace")
+                        try:
+                            exe = os.readlink("/proc/%s/exe" % pid)
+                        except OSError:
+                            exe = ""
+                        return int(pid), cmd[:CMD_MAX].decode("utf-8", "replace"), exe[:CMD_MAX]
                 except OSError:
                     continue
         except OSError:
             continue
-    return None, None
+    return None, None, None
 
 
 def proxy_v2(src_port, dst_port, tlvs, dst_ip="127.0.0.1"):
@@ -96,10 +103,12 @@ def pump(a, b):
             pass
 
 
-def tlvs_of(args, pid, cmd, via=None):
+def tlvs_of(args, pid, cmd, exe, via=None):
     t = [(TLV["run"], args.run or ""), (TLV["mode"], args.mode)]
     if pid is not None:
         t += [(TLV["pid"], str(pid)), (TLV["cmd"], cmd)]
+        if exe:
+            t.append((TLV["exe"], exe))
     if via:
         t.append((TLV["via"], via))
     return t
@@ -124,11 +133,11 @@ def serve(client, peer_port, args, path, redirected=False):
             dst_port, dst_ip = struct.unpack("!H", d[2:4])[0], socket.inet_ntoa(d[4:8])
         up.connect(path)
         if redirected:
-            pid, cmd = process_of(socket_inode(peer_port))
-            up.sendall(proxy_v2(peer_port, dst_port, tlvs_of(args, pid, cmd, "redirect"), dst_ip))
+            pid, cmd, exe = process_of(socket_inode(peer_port))
+            up.sendall(proxy_v2(peer_port, dst_port, tlvs_of(args, pid, cmd, exe, "redirect"), dst_ip))
         elif args.proxy == "v2":
-            pid, cmd = process_of(socket_inode(peer_port))
-            up.sendall(proxy_v2(peer_port, args.port, tlvs_of(args, pid, cmd)))
+            pid, cmd, exe = process_of(socket_inode(peer_port))
+            up.sendall(proxy_v2(peer_port, args.port, tlvs_of(args, pid, cmd, exe)))
     except OSError as e:
         sys.stderr.write("forbidden: the door's far side does not answer (%s)\n" % e)
         client.close()
@@ -148,8 +157,8 @@ def dns_one(us, q, addr, args, path):
     try:
         up.settimeout(5)
         up.connect(path)
-        pid, cmd = process_of(socket_inode(addr[1], ("/proc/net/udp", "/proc/net/udp6")))
-        up.sendall(proxy_v2(addr[1], 53, tlvs_of(args, pid, cmd, "dns")) + struct.pack("!H", len(q)) + q)
+        pid, cmd, exe = process_of(socket_inode(addr[1], ("/proc/net/udp", "/proc/net/udp6")))
+        up.sendall(proxy_v2(addr[1], 53, tlvs_of(args, pid, cmd, exe, "dns")) + struct.pack("!H", len(q)) + q)
         a = recv_exact(up, struct.unpack("!H", recv_exact(up, 2))[0])
         us.sendto(a, addr)
     except (OSError, EOFError, struct.error):

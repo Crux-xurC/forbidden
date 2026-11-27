@@ -1,6 +1,6 @@
 # forbidden — design
 
-This is the English design document. The Japanese original, with its history, is [ja/design-memo.md](ja/design-memo.md) (v0.3);
+This is the English design document; what is promised and what is not: [scope.md](scope.md). The Japanese original, with its history, is [ja/design-memo.md](ja/design-memo.md) (v0.3);
 where the two differ, the code is right, then the original. How to use it: [../README.md](../README.md).
 
 ## What it is
@@ -142,10 +142,20 @@ Unix sockets cross the namespace boundary — that is what the door uses. A prog
 | podman (`$XDG_RUNTIME_DIR/containers`), dockerd (`/var/run/docker.sock`) | start a container without a wall |
 | nix-daemon (`/nix/var/nix/daemon-socket`) | fetch from outside |
 
-- **Ordinary mode**: a mount namespace hides the known ones (directories covered with tmpfs, sockets with `/dev/null`): in
-  `$XDG_RUNTIME_DIR` `bus`, `emacs`, `gnupg`, `containers`, `podman`, `docker.sock`, `systemd`; `/run/dbus/system_bus_socket`,
-  `/run/docker.sock`, `/run/podman`, `/nix/var/nix/daemon-socket`, `~/.gnupg/S.*`; plus every path in `~/.config/forbidden/hide`
-  (`forbidden hide add <path>`; Citlalpol hides its config and records this way). What a daemon outside does on its own is out of scope.
+- **Ordinary mode: `/tmp` and `$XDG_RUNTIME_DIR` are the wall's own** (2026-11-27). A list of programs that act for you is never
+  complete — tmux (`tmux send-keys` types into a shell outside), screen, X11 and Wayland (keys into any window), a browser's
+  single-instance socket (a test's `webbrowser.open` would open the URL in the browser outside), an ssh-agent (signs with your keys) —
+  and most of them keep their sockets in those two directories. So the wall gets a new, empty tmpfs on each: what the shell and its
+  programs make there after `forbidden on` / `run` is seen inside, nothing from outside is. The directory the command starts in and
+  `$TMPDIR` are brought into the new `/tmp` when they are under it (`nix develop`'s `TMPDIR` is `/tmp/nix-shell.*`); the new `/tmp` is
+  built aside and moved over `/tmp`, and the directory is taken again, so that `..` from it walks the new tree, not the old one. The
+  door's relay holds its socket's directory open before the runtime directory is covered.
+- Outside those two, a mount namespace hides the known ones (directories covered with tmpfs, sockets with `/dev/null`):
+  `/run/dbus/system_bus_socket`, `/run/docker.sock`, `/run/podman`, `/nix/var/nix/daemon-socket`, `~/.gnupg/S.*`, screen's
+  (`/run/screen/S-<user>`, `~/.screen`), the ssh-agent's (`$SSH_AUTH_SOCK`); plus every path in `~/.config/forbidden/hide`
+  (`forbidden hide add <path>`; Citlalpol hides its config and records this way). The variables naming such programs (`DISPLAY`,
+  `WAYLAND_DISPLAY`, `TMUX`, `STY`, `SSH_AUTH_SOCK`, `DBUS_SESSION_BUS_ADDRESS`) are not set inside. What a daemon outside does on its
+  own is out of scope ([scope.md](scope.md)).
 - **`--strict`**: `$XDG_RUNTIME_DIR` is not shown at all (no list to rely on).
 - Run `nix develop` outside, then enter: `nix develop -c forbidden run -- …`. Fetching for a dev shell happens outside the wall.
 
@@ -162,8 +172,8 @@ A network-only wall is not enough for code that may be hostile.
 | network | the wall (the door only) | the same; the door fixed to Citlalpol; no door to a host TCP port |
 | writing files (`~/.bashrc`, `~/.config/autostart`, git hooks — run by your next shell outside) | possible | the system read-only, `$HOME` empty and thrown away, only `--dir` handed over (as a throw-away copy; the original never changes) |
 | reading files (`~/.ssh`, browser data, tokens) | possible | not visible |
-| sockets that act for you | the known ones hidden | `$XDG_RUNTIME_DIR` and `/var/run` sockets not shown |
-| processes outside (kill …) | visible | a separate PID namespace; every capability dropped |
+| sockets that act for you | `/tmp` and `$XDG_RUNTIME_DIR` the wall's own; the known ones elsewhere hidden | `$XDG_RUNTIME_DIR` and `/var/run` sockets not shown |
+| processes outside (kill …) | not visible (a PID namespace of its own) | the same; every capability dropped |
 | injecting into the terminal (TIOCSTI) | up to the kernel setting | a new session |
 | an interactive shell | `on` | `run` only (nothing can be left for the outer shell after `off`) |
 | the door list | read-only | not visible |
@@ -201,7 +211,7 @@ to allow; it never runs without a wall. `forbidden check` tells in advance.
 | File | Role |
 | --- | --- |
 | `bin/forbidden` | the command (bash): `run` / `on` / `off` / `status` / `door` / `hide` / `shell-init` / `check` |
-| `lib/inside.sh` | prepares the ordinary wall (inside, as that user namespace's root): brings the loopback up, starts the door's relay and then hides the socket's directory, makes `doors.json` read-only, hides the sockets above, sets the catch-all's rules; finally **drops to your own uid in one more user namespace** and starts the command (which then has no power over the wall's network or mounts) |
+| `lib/inside.sh` | prepares the ordinary wall (inside, as that user namespace's root): brings the loopback up, starts the door's relay and then hides the socket's directory, gives the wall its own `/tmp` and runtime directory (ordinary mode), makes `doors.json` read-only, hides the sockets above, sets the catch-all's rules; finally **drops to your own uid in one more user namespace** and starts the command (which then has no power over the wall's network or mounts) |
 | `lib/relay.py` | the door's relay (python3): `127.0.0.1:<port>` inside → the unix socket outside, PROXY v2 |
 | `test/run.sh`, `test/fake_door.py` | the checks above |
 
@@ -212,7 +222,9 @@ to allow; it never runs without a wall. `forbidden check` tells in advance.
 - `ping`: the wall's `ping_group_range` is opened, so an unprivileged ping fails for the right reason ("network unreachable") rather than
   "permission denied".
 - `on`: `--rcfile` reads `~/.bashrc`, redefines `forbidden`, adds `[forbidden]` to the prompt and writes the current directory out at the
-  end.
+  end. The rc file and the directory's file are in `~/.cache/forbidden/` (not `/tmp`: the wall has its own).
+- The header's process: the pid, the command line (`/proc/<pid>/cmdline`: what the process says of itself) and the executable
+  (`/proc/<pid>/exe`), in TLVs `0xE1`, `0xE2`, `0xE5` ([scope.md](scope.md) on how far they can be trusted).
 
 ## Milestones
 

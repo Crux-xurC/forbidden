@@ -23,6 +23,10 @@ lib="$here/lib"
 config_dir="${FORBIDDEN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/forbidden}"
 doors_file="$config_dir/doors.json"
 runtime="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+# files the shell inside hands back (on's rc, off's directory): not under /tmp, which is the wall's own
+cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/forbidden"
+# the ssh-agent this was started with (run unsets the variable before the list to hide is made)
+agent_sock="${SSH_AUTH_SOCK:-}"
 
 die() { echo "forbidden: $*" >&2; exit 125; }
 inside() { [ -n "${FORBIDDEN_ACTIVE:-}" ]; }
@@ -145,6 +149,11 @@ hide_list() {
     echo /run/avahi-daemon
     echo /run/nscd
     for s in "$HOME"/.gnupg/S.*; do [ -S "$s" ] && echo "$s"; done
+    # screen keeps its sockets outside /tmp and the runtime directory (those two are the wall's own in normal mode)
+    echo "/run/screen/S-${USER:-$(id -un)}"
+    echo "$HOME/.screen"
+    # an ssh-agent anywhere: it signs with your keys
+    [ -n "$agent_sock" ] && echo "$agent_sock"
     [ -f "$config_dir/hide" ] && grep -v '^\s*\(#\|$\)' "$config_dir/hide"
   } | while IFS= read -r p; do [ -e "$p" ] && readlink -f "$p"; done | sort -u
 }
@@ -190,10 +199,12 @@ wall() {
   fi
   local hide; hide="$(mktemp /tmp/forbidden-hide.XXXXXX)"
   hide_list > "$hide"
+  # where the wall's own /tmp is built before it is moved over /tmp (normal mode; empty again afterwards)
+  local stage; stage="$(mktemp -d /tmp/forbidden-stage.XXXXXX)"
   FORBIDDEN_MODE="$mode" unshare --user --map-root-user --net --mount --pid --fork --mount-proc --kill-child -- \
-    bash "$lib/inside.sh" "$(id -u)" "$(id -g)" "$port" "$sock" "$proxy" "$catch" "$config_dir" "$hide" -- "$@"
+    bash "$lib/inside.sh" "$(id -u)" "$(id -g)" "$port" "$sock" "$proxy" "$catch" "$config_dir" "$hide" "$runtime" "$stage" -- "$@"
   local code=$?
-  rm -f "$hide"
+  rm -f "$hide"; rmdir "$stage" 2>/dev/null
   return $code
 }
 
@@ -213,6 +224,8 @@ run_normal() {
     local kv; while IFS= read -r kv; do export "$kv"; done < <(proxy_env "$port")
   fi
   export FORBIDDEN_ACTIVE=1 FORBIDDEN_RUN="${FORBIDDEN_RUN:-$(new_run_id)}"
+  # what points at a program outside the wall: its sockets are not shown inside, so neither are the names
+  unset DISPLAY WAYLAND_DISPLAY TMUX TMUX_PANE STY WINDOW SSH_AUTH_SOCK SSH_AGENT_PID DBUS_SESSION_BUS_ADDRESS
   wall "$door" normal -- "$@"
 }
 
@@ -285,7 +298,8 @@ on_cmd() {
       *) die "on: unknown option $1" ;;
     esac
   done
-  local rc; rc="$(mktemp /tmp/forbidden-rc.XXXXXX)"
+  # not under /tmp: the wall has its own /tmp
+  local rc; mkdir -p "$cache_dir"; rc="$(mktemp "$cache_dir/rc.XXXXXX")"
   local self; self="$(readlink -f "${BASH_SOURCE[0]}")"
   { echo '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"'
     printf 'eval "$(%q shell-init bash)"\n' "$self"
@@ -315,7 +329,7 @@ shell_init() {
 forbidden() {
   case "\${1:-}" in
     on)
-      local __f_cwd; __f_cwd="\$(mktemp /tmp/forbidden-cwd.XXXXXX)"
+      local __f_cwd; mkdir -p "$cache_dir"; __f_cwd="\$(mktemp "$cache_dir/cwd.XXXXXX")"
       FORBIDDEN_CWD_FILE="\$__f_cwd" command "$self" "\$@"
       local __f_code=\$?
       [ -s "\$__f_cwd" ] && builtin cd -- "\$(cat "\$__f_cwd")" 2>/dev/null

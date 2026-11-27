@@ -1,6 +1,6 @@
 # forbidden
 
-Design: [docs/design.md](docs/design.md) (the Japanese original with its history: [docs/ja/](docs/ja/))
+Scope (what is promised, what is not): [docs/scope.md](docs/scope.md). Design: [docs/design.md](docs/design.md) (the Japanese original with its history: [docs/ja/](docs/ja/))
 
 `forbidden on` in a terminal: from the next command, nothing that terminal starts can reach the network. `forbidden off`: back as
 before. `forbidden run -- <command>` does the same for one command (a test run, a REPL). It is a wall and nothing else: no
@@ -13,7 +13,9 @@ every attempt. forbidden knows nothing of what is behind the door.
 Use it around anything that must not reach the network by accident: when you run contract tests with Citlalpol, run them inside
 `forbidden on` and check that they never go out unintentionally.
 
-Two strengths. By default it guards against accidents: a test or a REPL that reaches out by mistake. `forbidden run --strict`
+Two strengths. By default it guards against accidents: a test or a REPL that reaches out by mistake, also through a program outside
+that would act for it — `/tmp` and `$XDG_RUNTIME_DIR` are the wall's own (what is made there after `forbidden on` is seen, tmux, X11,
+Wayland or an ssh-agent outside are not), and the known sockets elsewhere are hidden. `forbidden run --strict`
 is for looking at a program you do not trust (someone else's tool): besides the network it hides your files, your session's sockets
 (D-Bus, an editor server, gpg-agent), other processes and the terminal, and its only door is Citlalpol. Even then it promises only
 that ordinary means do not get out; it does not stand against kernel exploits — use a virtual machine for that. Linux only

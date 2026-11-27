@@ -6,7 +6,7 @@ door sends (TLV via: redirect / dns) is logged and closed."""
 import json, os, socket, struct, sys, threading
 
 SIG = b"\r\n\r\n\x00\r\nQUIT\n"
-NAMES = {0xE0: "run", 0xE1: "pid", 0xE2: "cmd", 0xE3: "mode", 0xE4: "via"}
+NAMES = {0xE0: "run", 0xE1: "pid", 0xE2: "cmd", 0xE3: "mode", 0xE4: "via", 0xE5: "exe"}
 
 def recv_exact(c, n):
     b = b""
